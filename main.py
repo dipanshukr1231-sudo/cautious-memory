@@ -39,13 +39,13 @@ BROADCAST_WORKERS = max(1, min(20, int(os.environ.get("BROADCAST_WORKERS", "8"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 INITIAL_OWNER_IDS = {
     int(value.strip())
-    for value in os.environ.get("OWNER_IDS", "8753914631").split(",")
+    for value in os.environ.get("OWNER_IDS", "").split(",")
     if value.strip().lstrip("-").isdigit()
 }
 # Backward-compatible first-run fallback: if OWNER_IDS is omitted, ADMIN_IDS become owners.
 INITIAL_ADMIN_IDS = {
     int(value.strip())
-    for value in os.environ.get("ADMIN_IDS", "8565258976").split(",")
+    for value in os.environ.get("ADMIN_IDS", "").split(",")
     if value.strip().lstrip("-").isdigit()
 }
 if not INITIAL_OWNER_IDS:
@@ -226,20 +226,16 @@ class Database:
         self.path = path
         self.write_lock = asyncio.Lock()
 
-    @asynccontextmanager
     async def connect(self):
         db = await aiosqlite.connect(self.path, timeout=30)
         db.row_factory = aiosqlite.Row
-        try:
-            await db.execute("PRAGMA foreign_keys=ON")
-            await db.execute("PRAGMA busy_timeout=10000")
-            yield db
-        finally:
-            await db.close()
+        await db.execute("PRAGMA foreign_keys=ON")
+        await db.execute("PRAGMA busy_timeout=10000")
+        return db
 
     async def init(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        async with self.connect() as db:
+        async with await self.connect() as db:
             await db.executescript(SCHEMA)
             now = utcnow()
             defaults = {
@@ -266,40 +262,40 @@ class Database:
 
     async def execute(self, sql: str, params=()):
         async with self.write_lock:
-            async with self.connect() as db:
+            async with await self.connect() as db:
                 cur = await db.execute(sql, params)
                 await db.commit()
                 return cur.lastrowid, cur.rowcount
 
     async def executescript(self, sql: str):
         async with self.write_lock:
-            async with self.connect() as db:
+            async with await self.connect() as db:
                 await db.executescript(sql)
                 await db.commit()
 
     async def fetchone(self, sql: str, params=()):
-        async with self.connect() as db:
+        async with await self.connect() as db:
             async with db.execute(sql, params) as cur:
                 return await cur.fetchone()
 
     async def fetchall(self, sql: str, params=()):
-        async with self.connect() as db:
+        async with await self.connect() as db:
             async with db.execute(sql, params) as cur:
                 return await cur.fetchall()
 
     @asynccontextmanager
     async def transaction(self):
         await self.write_lock.acquire()
+        db = await self.connect()
         try:
-            async with self.connect() as db:
-                try:
-                    await db.execute("BEGIN IMMEDIATE")
-                    yield db
-                    await db.commit()
-                except Exception:
-                    await db.rollback()
-                    raise
+            await db.execute("BEGIN IMMEDIATE")
+            yield db
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
         finally:
+            await db.close()
             self.write_lock.release()
 
     async def is_owner(self, user_id: int) -> bool:
