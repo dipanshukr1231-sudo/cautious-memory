@@ -19,7 +19,7 @@ from typing import Optional
 import aiosqlite
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
+from telegram.error import BadRequest, Conflict, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import (
     AIORateLimiter,
     Application,
@@ -39,23 +39,29 @@ BROADCAST_WORKERS = max(1, min(20, int(os.environ.get("BROADCAST_WORKERS", "8"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 INITIAL_OWNER_IDS = {
     int(value.strip())
-    for value in os.environ.get("OWNER_IDS", "8753914631").split(",")
+    for value in os.environ.get("OWNER_IDS", "").split(",")
     if value.strip().lstrip("-").isdigit()
 }
-# Backward-compatible first-run fallback: if OWNER_IDS is omitted, ADMIN_IDS become owners.
+
 INITIAL_ADMIN_IDS = {
     int(value.strip())
-    for value in os.environ.get("ADMIN_IDS", "8565258976").split(",")
+    for value in os.environ.get("ADMIN_IDS", "").split(",")
     if value.strip().lstrip("-").isdigit()
 }
 if not INITIAL_OWNER_IDS:
     INITIAL_OWNER_IDS = set(INITIAL_ADMIN_IDS)
+
 DEFAULT_START = os.environ.get("DEFAULT_START_MESSAGE", "Hello, Welcome to our bot!")
 DEFAULT_MAINTENANCE = os.environ.get(
     "DEFAULT_MAINTENANCE_MESSAGE", "The bot is temporarily under maintenance. Please try again later."
 )
 WEB_HOST = os.environ.get("WEB_HOST", "0.0.0.0")
-WEB_PORT = int(os.environ.get("PORT", os.environ.get("WEB_PORT", "10000")))
+WEB_PORT = int(os.environ.get("PORT", os.environ.get("WEB_PORT", "8080")))
+
+# Webhook settings (recommended on Railway)
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()  # e.g. https://your-app.up.railway.app
+WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "telegram")
+USE_WEBHOOK = bool(WEBHOOK_URL) or os.environ.get("USE_WEBHOOK", "false").lower() in ("1", "true", "yes")
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -162,18 +168,14 @@ CREATE TABLE IF NOT EXISTS errors (
 CREATE INDEX IF NOT EXISTS idx_errors_date ON errors(created_at DESC);
 """
 
-
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
 
 def today() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
-
 def esc(value: object) -> str:
     return html.escape(str(value or ""))
-
 
 def human_duration(seconds: float) -> str:
     seconds = max(0, int(seconds))
@@ -190,7 +192,6 @@ def human_duration(seconds: float) -> str:
     parts.append(f"{seconds}s")
     return " ".join(parts)
 
-
 def message_kind(message) -> str:
     for name in (
         "text", "photo", "video", "document", "voice", "audio", "sticker",
@@ -200,13 +201,11 @@ def message_kind(message) -> str:
             return name
     return "other"
 
-
 def owner_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🛡 Manage Admins", callback_data="admins")],
         [InlineKeyboardButton("⚙️ Open Admin Panel", callback_data="panel")],
     ])
-
 
 def main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -216,10 +215,8 @@ def main_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🩺 System", callback_data="system")],
     ])
 
-
 def back_keyboard(target: str = "panel") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data=target), InlineKeyboardButton("❌ Cancel", callback_data="cancel")]])
-
 
 class Database:
     def __init__(self, path: Path):
@@ -260,7 +257,7 @@ class Database:
             for admin_id in INITIAL_ADMIN_IDS - INITIAL_OWNER_IDS:
                 await db.execute(
                     "INSERT OR IGNORE INTO admins(user_id,added_at,added_by) VALUES(?,?,?)",
-                    (admin_id, now, next(iter(INITIAL_OWNER_IDS))),
+                    (admin_id, now, next(iter(INITIAL_OWNER_IDS)) if INITIAL_OWNER_IDS else None),
                 )
             await db.commit()
 
@@ -417,11 +414,9 @@ class Database:
         except Exception:
             logger.exception("Could not persist error")
 
-
 db = Database(DATABASE_PATH)
 START_MONOTONIC = time.monotonic()
 BROADCAST_TASKS: dict[int, asyncio.Task] = {}
-
 
 async def ensure_owner(update: Update) -> bool:
     user = update.effective_user
@@ -433,7 +428,6 @@ async def ensure_owner(update: Update) -> bool:
         return False
     return True
 
-
 async def ensure_admin(update: Update) -> bool:
     user = update.effective_user
     if not user or not await db.is_admin(user.id):
@@ -444,20 +438,12 @@ async def ensure_admin(update: Update) -> bool:
         return False
     return True
 
-
 async def safe_edit(query, text: str, keyboard=None, parse_mode=ParseMode.HTML):
     try:
         await query.edit_message_text(text, reply_markup=keyboard, parse_mode=parse_mode)
     except BadRequest as exc:
         if "Message is not modified" not in str(exc):
             raise
-
-
-async def send_counted(bot, user_id: int, method: str, **kwargs):
-    result = await getattr(bot, method)(chat_id=user_id, **kwargs)
-    await db.log_message("outgoing", user_id, None, method, result.chat_id, result.message_id)
-    return result
-
 
 async def panel_text() -> str:
     total = (await db.fetchone("SELECT COUNT(*) n FROM users"))["n"]
@@ -471,7 +457,6 @@ async def panel_text() -> str:
         f"Active ({ACTIVE_DAYS}d): <b>{active:,}</b>\n\n"
         "Choose a section:"
     )
-
 
 async def owner_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_owner(update):
@@ -487,13 +472,11 @@ async def owner_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.effective_message.reply_text(text, reply_markup=owner_keyboard(), parse_mode=ParseMode.HTML)
 
-
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_admin(update):
         return
     context.user_data.clear()
     await update.effective_message.reply_text(await panel_text(), reply_markup=main_keyboard(), parse_mode=ParseMode.HTML)
-
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not update.effective_message:
@@ -511,7 +494,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = await db.setting("start_message", DEFAULT_START)
     sent = await update.effective_message.reply_text(text)
     await db.log_message("outgoing", update.effective_user.id, None, "start", sent.chat_id, sent.message_id)
-
 
 async def statistics_text() -> str:
     now = datetime.now(timezone.utc)
@@ -567,7 +549,6 @@ async def statistics_text() -> str:
     ]
     return "\n".join(lines)
 
-
 async def users_text() -> str:
     row = await db.fetchone("""SELECT COUNT(*) total,
         SUM(CASE WHEN is_banned=1 THEN 1 ELSE 0 END) banned,
@@ -586,7 +567,6 @@ async def users_text() -> str:
         label = f"@{r['username']}" if r['username'] else (r['first_name'] or "Unknown")
         lines.append(f"{'🚫' if r['is_banned'] else '👤'} <code>{r['user_id']}</code> - {esc(label)}")
     return "\n".join(lines)
-
 
 async def user_detail_text(user_id: int) -> Optional[str]:
     u = await db.fetchone("SELECT * FROM users WHERE user_id=?", (user_id,))
@@ -608,7 +588,6 @@ async def user_detail_text(user_id: int) -> Optional[str]:
         f"Messages: {m['total']} ({m['incoming'] or 0} in / {m['outgoing'] or 0} out)"
     )
 
-
 async def backup_database() -> Path:
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -629,7 +608,6 @@ async def backup_database() -> Path:
     db_copy.unlink(missing_ok=True)
     return archive
 
-
 async def restore_database(archive_path: Path):
     temp_dir = BACKUP_DIR / f"restore_{uuid.uuid4().hex}"
     temp_dir.mkdir(parents=True, exist_ok=True)
@@ -641,23 +619,22 @@ async def restore_database(archive_path: Path):
             if not db_name or db_name not in names or Path(db_name).name != db_name:
                 raise ValueError("Invalid backup manifest")
             zf.extract(db_name, temp_dir)
-        candidate = temp_dir / db_name
-        check = sqlite3.connect(candidate)
-        try:
-            integrity = check.execute("PRAGMA integrity_check").fetchone()[0]
-            tables = {r[0] for r in check.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            required = {"users", "admins", "settings", "message_log", "broadcasts"}
-            if integrity != "ok" or not required.issubset(tables):
-                raise ValueError("Backup database failed validation")
-        finally:
-            check.close()
-        safety = await backup_database()
-        async with db.write_lock:
-            shutil.copy2(candidate, DATABASE_PATH)
-        return safety
+            candidate = temp_dir / db_name
+            check = sqlite3.connect(candidate)
+            try:
+                integrity = check.execute("PRAGMA integrity_check").fetchone()[0]
+                tables = {r[0] for r in check.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                required = {"users", "admins", "settings", "message_log", "broadcasts"}
+                if integrity != "ok" or not required.issubset(tables):
+                    raise ValueError("Backup database failed validation")
+            finally:
+                check.close()
+            safety = await backup_database()
+            async with db.write_lock:
+                shutil.copy2(candidate, DATABASE_PATH)
+            return safety
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
-
 
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.callback_query:
@@ -712,7 +689,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         import csv
         with path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(rows[0].keys() if rows else ["user_id","username","first_name","last_name","language_code","is_banned","is_active","created_at","last_seen"])
+            writer.writerow(rows[0].keys() if rows else ["user_id", "username", "first_name", "last_name", "language_code", "is_banned", "is_active", "created_at", "last_seen"])
             writer.writerows([tuple(r) for r in rows])
         await context.bot.send_document(q.from_user.id, document=path.open("rb"), caption=f"Exported {len(rows)} users.")
         path.unlink(missing_ok=True)
@@ -819,7 +796,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("⬅️ Back", callback_data="panel")],
         ]))
 
-
 async def admin_state_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if not await db.is_admin(update.effective_user.id):
         return False
@@ -918,7 +894,6 @@ async def admin_state_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         ]))
     return True
 
-
 async def run_broadcast(application: Application, bid: int, source_chat: int, source_message: int, admin_id: int, progress_chat: int, progress_message: int):
     try:
         users = await db.fetchall("SELECT user_id FROM users WHERE is_banned=0 AND is_active=1 ORDER BY user_id")
@@ -1008,7 +983,6 @@ async def run_broadcast(application: Application, bid: int, source_chat: int, so
     finally:
         BROADCAST_TASKS.pop(bid, None)
 
-
 async def forward_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = update.effective_message
@@ -1052,7 +1026,6 @@ async def forward_user_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if delivered == 0:
         logger.error("Message from %s could not reach any admin", user.id)
 
-
 async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if not message or not message.reply_to_message:
@@ -1076,7 +1049,6 @@ async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await db.record_error(f"admin_reply:{uid}", exc)
         await message.reply_text(f"❌ Delivery failed: {esc(exc)}", parse_mode=ParseMode.HTML)
 
-
 async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_message or not update.effective_user:
         return
@@ -1084,17 +1056,23 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await forward_user_message(update, context)
 
-
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    exc = context.error or RuntimeError("Unknown error")
+    exc = context.error
+    if isinstance(exc, Conflict):
+        # This is expected when another instance is running. Do not crash or spam logs.
+        logger.warning("Conflict detected (another getUpdates is running). Waiting...")
+        return
+    if isinstance(exc, (NetworkError, TimedOut, RetryAfter)):
+        logger.warning("Temporary network issue: %s", exc)
+        return
+
     logger.error("Unhandled error", exc_info=exc)
     await db.record_error("update_handler", exc)
     if isinstance(update, Update) and update.effective_message and update.effective_user and await db.is_admin(update.effective_user.id):
         try:
-            await update.effective_message.reply_text("❌ The operation failed. Details were logged; no success was recorded.")
+            await update.effective_message.reply_text("❌ The operation failed. Details were logged.")
         except Exception:
             pass
-
 
 async def post_init(application: Application):
     await db.init()
@@ -1102,7 +1080,6 @@ async def post_init(application: Application):
     await db.execute("DELETE FROM processed_updates WHERE processed_at<?", ((datetime.now(timezone.utc)-timedelta(days=14)).isoformat(timespec="seconds"),))
     me = await application.bot.get_me()
     logger.info("Started @%s (%s)", me.username, me.id)
-
 
 async def post_shutdown(application: Application):
     tasks = list(BROADCAST_TASKS.values())
@@ -1112,16 +1089,16 @@ async def post_shutdown(application: Application):
         await asyncio.gather(*tasks, return_exceptions=True)
     logger.info("Shutdown complete")
 
-
 def build_application() -> Application:
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN environment variable is required")
     if not INITIAL_OWNER_IDS and not DATABASE_PATH.exists():
         raise RuntimeError("OWNER_IDS must contain at least one numeric Telegram ID on first startup")
+
     application = (
         ApplicationBuilder()
         .token(TOKEN)
-        .rate_limiter(AIORateLimiter(max_retries=2))
+        .rate_limiter(AIORateLimiter(max_retries=3))
         .concurrent_updates(32)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
@@ -1131,55 +1108,35 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("dkboss", owner_command), group=0)
     application.add_handler(CommandHandler("admin", admin_command), group=0)
     application.add_handler(CallbackQueryHandler(callback_router), group=0)
-    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, message_router), group=1)
+    application.add_handler(MessageHandler(filters.ALL & \~filters.COMMAND, message_router), group=1)
     application.add_error_handler(error_handler)
     return application
 
-
-def start_health_server():
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-    class HealthHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            if self.path in {"/", "/health", "/healthz"}:
-                payload = json.dumps({
-                    "status": "ok",
-                    "service": "telegram-bot",
-                    "uptime_seconds": int(time.monotonic() - START_MONOTONIC),
-                }).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(payload)))
-                self.end_headers()
-                self.wfile.write(payload)
-            else:
-                self.send_response(404)
-                self.end_headers()
-
-        def log_message(self, format, *args):
-            logger.debug("Health server: " + format, *args)
-
-    server = ThreadingHTTPServer((WEB_HOST, WEB_PORT), HealthHandler)
-    thread = threading.Thread(target=server.serve_forever, name="health-server", daemon=True)
-    thread.start()
-    logger.info("Health server listening on %s:%s", WEB_HOST, WEB_PORT)
-    return server
-
-
 def main():
-    health_server = start_health_server()
     application = build_application()
-    try:
-        application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=False,
+
+    if USE_WEBHOOK and WEBHOOK_URL:
+        # Best mode for Railway / production
+        webhook_url = f"{WEBHOOK_URL.rstrip('/')}/{WEBHOOK_PATH}"
+        logger.info("Starting in WEBHOOK mode → %s", webhook_url)
+        application.run_webhook(
+            listen=WEB_HOST,
+            port=WEB_PORT,
+            url_path=WEBHOOK_PATH,
+            webhook_url=webhook_url,
+            drop_pending_updates=True,
             close_loop=True,
             stop_signals=(signal.SIGINT, signal.SIGTERM),
         )
-    finally:
-        health_server.shutdown()
-        health_server.server_close()
-
+    else:
+        # Polling mode (only if you really need it)
+        logger.info("Starting in POLLING mode")
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+            close_loop=True,
+            stop_signals=(signal.SIGINT, signal.SIGTERM),
+        )
 
 if __name__ == "__main__":
     main()
